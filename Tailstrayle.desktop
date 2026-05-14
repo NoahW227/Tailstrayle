@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tailstrayle
+Comment=Tailscale tray icon
+Exec=$HOME/.local/bin/Tailstrayle
+Icon=network-vpn
+Terminal=false
+X-KDE-autostart-after=panel
+X-GNOME-Autostart-enabled=true
+EOF
