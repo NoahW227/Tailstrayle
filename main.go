@@ -1,12 +1,14 @@
 package main
 
 import (
-	"encoding/json"
+	"cmp"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,141 +24,112 @@ var onIcon []byte
 //go:embed assets/off-icon.png
 var offIcon []byte
 
-// Subset of `tailscale status --json` output
-type tsStatus struct {
-	BackendState string // "Running", "Stopped", "NeedsLogin", "NoState", "Starting"
-	Self         tsPeer
-	Peer         map[string]tsPeer
-	User         map[string]tsUser
-	CurrentTailnet *tsTailnet `json:",omitempty"`
+// preference is a toggle in the Preferences submenu, mirroring the options in
+// the Windows client's Preferences menu that apply on Linux.
+type preference struct {
+	title   string
+	checked func(*tsPrefs) bool
+	flag    func(checked bool) string // `tailscale set` flag that makes checked true/false
 }
 
-type tsPeer struct {
-	HostName       string
-	DNSName        string
-	TailscaleIPs   []string
-	Online         bool
-	ExitNode       bool
-	ExitNodeOption bool
-	UserID         int64
+func boolFlag(name string) func(bool) string {
+	return func(v bool) string { return fmt.Sprintf("--%s=%t", name, v) }
 }
 
-const maxExitNodes = 5
-
-type tsUser struct {
-	LoginName   string
-	DisplayName string
+var preferences = []preference{
+	{
+		title:   "Use Tailscale DNS settings",
+		checked: func(p *tsPrefs) bool { return p.CorpDNS },
+		flag:    boolFlag("accept-dns"),
+	},
+	{
+		title:   "Use Tailscale subnets",
+		checked: func(p *tsPrefs) bool { return p.RouteAll },
+		flag:    boolFlag("accept-routes"),
+	},
+	{
+		title:   "Allow incoming connections",
+		checked: func(p *tsPrefs) bool { return !p.ShieldsUp },
+		flag:    func(v bool) string { return boolFlag("shields-up")(!v) },
+	},
+	{
+		title:   "Allow local network access via exit node",
+		checked: func(p *tsPrefs) bool { return p.ExitNodeAllowLANAccess },
+		flag:    boolFlag("exit-node-allow-lan-access"),
+	},
+	{
+		title:   "Automatically install updates",
+		checked: func(p *tsPrefs) bool { return p.AutoUpdate.Apply != nil && *p.AutoUpdate.Apply },
+		flag:    boolFlag("auto-update"),
+	},
 }
 
-type tsTailnet struct {
-	Name string
-}
-
-func (s *tsStatus) accountName() string {
-	if s == nil {
-		return ""
-	}
-	if u, ok := s.User[fmt.Sprintf("%d", s.Self.UserID)]; ok {
-		if u.LoginName != "" {
-			return u.LoginName
-		}
-		return u.DisplayName
-	}
-	return ""
-}
-
-func (s *tsStatus) connected() bool {
-	return s != nil && s.BackendState == "Running"
-}
-
-func (s *tsStatus) loggedIn() bool {
-	if s == nil {
-		return false
-	}
-	switch s.BackendState {
-	case "NeedsLogin", "NoState":
-		return false
-	}
-	return true
-}
-
-func (s *tsStatus) currentExitNode() string {
-	if s == nil {
-		return ""
-	}
-	for _, p := range s.Peer {
-		if p.ExitNode {
-			return p.HostName
-		}
-	}
-	return ""
-}
-
-func fetchStatus() (*tsStatus, error) {
-	out, err := exec.Command("tailscale", "status", "--json").Output()
-	if err != nil {
-		return nil, err
-	}
-	var s tsStatus
-	if err := json.Unmarshal(out, &s); err != nil {
-		return nil, err
-	}
-	return &s, nil
+type trayState struct {
+	connected bool
+	tooltip   string
 }
 
 type app struct {
-	mu     sync.Mutex
-	status *tsStatus
+	// mu serializes refreshes and guards everything below. Menu clicks and
+	// the poller run on separate goroutines.
+	mu   sync.Mutex
+	snap snapshot
+	tray *trayState // last applied; nil until first render
 
-	mAccount  *systray.MenuItem
-	mConnect  *systray.MenuItem
-	mExitMenu *systray.MenuItem
-	mCopyIP   *systray.MenuItem
-	mRefresh  *systray.MenuItem
-	mQuit     *systray.MenuItem
-
-	exitItems   []*systray.MenuItem
-	exitTargets []string // parallel slice: which hostname each slot currently targets
+	account   *item
+	tailnet   *item
+	tailnets  *choiceList
+	connect   *item
+	exitNode  *item
+	exitNodes *choiceList
+	copyIP    *item
+	prefsMenu *item
+	prefItems []*item
 }
 
 func main() {
 	systray.Run(onReady, onExit)
 }
 
+func addItem(title string) *item {
+	return newItem(systray.AddMenuItem(title, ""), title)
+}
+
 func onReady() {
 	a := &app{}
 
-	systray.SetIcon(offIcon)
 	systray.SetTitle("Tailstrayle")
-	systray.SetTooltip("Tailscale")
 
-	a.mAccount = systray.AddMenuItem("Not logged in", "")
-	a.mAccount.Disable()
+	a.account = addItem("")
+	a.tailnet = addItem("Tailnet")
+	a.tailnets = &choiceList{parent: a.tailnet.mi, onClick: a.switchProfile}
 	systray.AddSeparator()
 
-	a.mConnect = systray.AddMenuItem("Connect", "Bring Tailscale up")
-	a.mExitMenu = systray.AddMenuItem("Exit node", "Choose an exit node")
-	a.mCopyIP = systray.AddMenuItem("Copy IP", "Copy this device's Tailscale IP")
+	a.connect = addItem("Connect")
+	a.exitNode = addItem("Exit node")
+	a.exitNodes = &choiceList{parent: a.exitNode.mi, onClick: a.setExitNode}
+	a.copyIP = addItem("Copy IP")
+	a.prefsMenu = addItem("Preferences")
+	for _, p := range preferences {
+		it := newItem(a.prefsMenu.mi.AddSubMenuItemCheckbox(p.title, "", false), p.title)
+		it.mi.Click(func() { a.togglePref(p, it) })
+		a.prefItems = append(a.prefItems, it)
+	}
 	systray.AddSeparator()
-	a.mRefresh = systray.AddMenuItem("Refresh", "Refresh status now")
-	a.mQuit = systray.AddMenuItem("Quit", "Exit the app")
 
-	a.mConnect.Click(a.toggleConnect)
-	a.mCopyIP.Click(a.copyIP)
-	a.mRefresh.Click(func() { a.refresh() })
-	a.mQuit.Click(func() { systray.Quit() })
+	refresh := addItem("Refresh")
+	quit := addItem("Quit")
 
-	systray.SetOnClick(func(menu systray.IMenu) {
-		a.toggleConnect()
-	})
+	a.connect.mi.Click(a.toggleConnect)
+	a.copyIP.mi.Click(a.copyIPToClipboard)
+	refresh.mi.Click(a.refresh)
+	quit.mi.Click(systray.Quit)
 
-	// Initial fetch + render
+	systray.SetOnClick(func(systray.IMenu) { a.toggleConnect() })
+
 	a.refresh()
-
-	// Background poller
 	go a.pollLoop()
 
-	// Signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -179,189 +152,249 @@ func (a *app) pollLoop() {
 	}
 }
 
-// refresh pulls fresh status and re-renders the menu
+// refresh pulls fresh state and re-renders the menu
 func (a *app) refresh() {
-	s, err := fetchStatus()
-	if err != nil {
-		log.Printf("status fetch failed: %v", err)
-		a.mu.Lock()
-		a.status = nil
-		a.mu.Unlock()
-		a.render()
-		return
-	}
 	a.mu.Lock()
-	a.status = s
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	a.snap = fetchSnapshot()
 	a.render()
 }
 
-// render updates all menu items and the tray icon to reflect current state
+// render updates all menu items and the tray icon to reflect a.snap.
+// Must be called with a.mu held.
 func (a *app) render() {
-	a.mu.Lock()
-	s := a.status
-	a.mu.Unlock()
+	s, p := a.snap.status, a.snap.prefs
+	tailnet := a.currentTailnet()
 
-	if s == nil {
-		a.mAccount.SetTitle("Tailscale daemon unavailable")
-		a.mConnect.Disable()
-		a.mExitMenu.Disable()
-		a.mCopyIP.Disable()
-		systray.SetIcon(offIcon)
-		systray.SetTooltip("Tailscale: unavailable")
-		return
-	}
-
-	// Account label
-	if s.loggedIn() {
+	switch {
+	case s == nil:
+		a.account.set("Tailscale daemon unavailable", false, false, true)
+	case !s.loggedIn():
+		a.account.set("Not logged in — run `sudo tailscale login`", false, false, true)
+	default:
 		name := s.accountName()
 		if name == "" {
 			name = "Logged in"
 		}
-		a.mAccount.SetTitle(name)
-	} else {
-		a.mAccount.SetTitle("Not logged in — run `sudo tailscale login`")
+		a.account.set(name, false, false, true)
 	}
 
-	// Connect toggle
-	if !s.loggedIn() {
-		a.mConnect.Disable()
-		a.mConnect.SetTitle("Connect")
+	a.renderTailnets(tailnet)
+
+	switch {
+	case !s.loggedIn():
+		a.connect.set("Connect", false, false, true)
+	case s.connected():
+		a.connect.set("Disconnect", true, false, true)
+	default:
+		a.connect.set("Connect", true, false, true)
+	}
+
+	a.renderExitNodes(s, p)
+
+	if ip := s.ip(); s.connected() && ip != "" {
+		a.copyIP.set("Copy IP ("+ip+")", true, false, true)
 	} else {
-		a.mConnect.Enable()
-		if s.connected() {
-			a.mConnect.SetTitle("Disconnect")
+		a.copyIP.set("Copy IP", false, false, true)
+	}
+
+	prefsEnabled := s.loggedIn() && p != nil
+	a.prefsMenu.set("Preferences", prefsEnabled, false, true)
+	for i, pref := range preferences {
+		a.prefItems[i].set(pref.title, prefsEnabled, p != nil && pref.checked(p), true)
+	}
+
+	tray := trayState{connected: s.connected()}
+	switch {
+	case s == nil:
+		tray.tooltip = "Tailscale: daemon unavailable"
+	case !s.loggedIn():
+		tray.tooltip = "Tailscale: not logged in"
+	case !s.connected():
+		tray.tooltip = "Tailscale: disconnected"
+	default:
+		tray.tooltip = "Tailscale: connected"
+		if tailnet != "" {
+			tray.tooltip += " to " + tailnet
+		}
+		if ip := s.ip(); ip != "" {
+			tray.tooltip += " (" + ip + ")"
+		}
+	}
+	if a.tray == nil || *a.tray != tray {
+		if tray.connected {
+			systray.SetIcon(onIcon)
 		} else {
-			a.mConnect.SetTitle("Connect")
+			systray.SetIcon(offIcon)
 		}
+		systray.SetTooltip(tray.tooltip)
+		a.tray = &tray
 	}
-
-	// Icon + tooltip
-	if s.connected() {
-		systray.SetIcon(onIcon)
-		ip := ""
-		if len(s.Self.TailscaleIPs) > 0 {
-			ip = s.Self.TailscaleIPs[0]
-		}
-		if ip != "" {
-			systray.SetTooltip("Tailscale: connected (" + ip + ")")
-		} else {
-			systray.SetTooltip("Tailscale: connected")
-		}
-		a.mCopyIP.Enable()
-	} else {
-		systray.SetIcon(offIcon)
-		systray.SetTooltip("Tailscale: disconnected")
-		a.mCopyIP.Disable()
-	}
-
-	// Exit node submenu
-	a.rebuildExitNodes(s)
 }
 
-func (a *app) rebuildExitNodes(s *tsStatus) {
-	if !s.loggedIn() {
-		a.mExitMenu.Disable()
-		return
+// currentTailnet returns the name of the active tailnet, or "" if unknown.
+// Must be called with a.mu held.
+func (a *app) currentTailnet() string {
+	if name := a.snap.status.tailnetName(); name != "" {
+		return name
 	}
-	a.mExitMenu.Enable()
-
-	// One-time pre-allocate a fixed pool of submenu items.
-	// Slot 0 is always "None" (clear exit node). The rest fill in as
-	// exit-node-capable peers appear.
-	if len(a.exitItems) == 0 {
-		a.exitItems = make([]*systray.MenuItem, maxExitNodes+1)
-		a.exitTargets = make([]string, maxExitNodes+1)
-		for i := 0; i <= maxExitNodes; i++ {
-			mi := a.mExitMenu.AddSubMenuItem("", "")
-			idx := i // capture for closure
-			mi.Click(func() {
-				a.mu.Lock()
-				target := a.exitTargets[idx]
-				a.mu.Unlock()
-				a.setExitNode(target)
-			})
-			mi.Disable()
-			a.exitItems[i] = mi
+	for _, pr := range a.snap.profiles {
+		if pr.ID == a.snap.currentProfile {
+			return pr.tailnet()
 		}
 	}
+	return ""
+}
 
-	// Build the desired list of options
-	current := s.currentExitNode()
-	type opt struct {
-		host string
-		cur  bool
-	}
-	opts := []opt{{host: "", cur: current == ""}} // None
-	for _, p := range s.Peer {
-		if p.ExitNodeOption {
-			opts = append(opts, opt{host: p.HostName, cur: p.HostName == current})
+// renderTailnets lists every logged-in profile (tailnet + account) so the
+// user can switch between them, like the account menu in the Windows client.
+func (a *app) renderTailnets(current string) {
+	var choices []choice
+	for _, pr := range a.snap.profiles {
+		label := pr.tailnet()
+		if pr.Name != "" && pr.Name != label {
+			label += " (" + pr.Name + ")"
 		}
+		choices = append(choices, choice{
+			label:   label,
+			value:   pr.ID,
+			checked: pr.ID == a.snap.currentProfile,
+			enabled: true,
+		})
 	}
+	slices.SortFunc(choices, func(x, y choice) int { return cmp.Compare(x.label, y.label) })
 
-	// Fill in the slots
-	a.mu.Lock()
-	for i, mi := range a.exitItems {
-		if i < len(opts) {
-			o := opts[i]
-			label := o.host
-			if label == "" {
-				label = "None"
+	title := "Tailnet: " + current
+	if current == "" {
+		title = "Switch tailnet"
+	}
+	a.tailnet.set(title, a.snap.status != nil && len(choices) > 0, false, true)
+	a.tailnets.set(choices)
+}
+
+func (a *app) renderExitNodes(s *tsStatus, p *tsPrefs) {
+	type node struct {
+		name    string
+		ip      string
+		online  bool
+		current bool
+	}
+	var nodes []node
+	var current string
+	anyOnline := false
+	if s != nil {
+		for _, peer := range s.Peer {
+			isCurrent := peer.ExitNode || (p != nil && p.ExitNodeID != "" && peer.ID == p.ExitNodeID)
+			if (!peer.ExitNodeOption && !isCurrent) || len(peer.TailscaleIPs) == 0 {
+				continue
 			}
-			if o.cur {
-				label = "✓ " + label
+			n := node{name: peer.machineName(), ip: peer.TailscaleIPs[0], online: peer.Online, current: isCurrent}
+			nodes = append(nodes, n)
+			if n.current {
+				current = n.name
 			}
-			mi.SetTitle(label)
-			a.exitTargets[i] = o.host
-			mi.Enable()
-		} else {
-			// Unused slot: attempt to hide
-			mi.SetTitle(" ")
-			a.exitTargets[i] = ""
-			mi.Disable()
+			if n.online {
+				anyOnline = true
+			}
 		}
 	}
-	a.mu.Unlock()
+	// s.Peer is a map; sort so entries don't shuffle on every poll.
+	slices.SortFunc(nodes, func(x, y node) int { return cmp.Compare(x.name, y.name) })
 
-	// Log when tailnet has more exit-node-capable peers than pre-allocated slots
-	if len(opts) > len(a.exitItems) {
-		log.Printf("warning: %d exit nodes available but only %d slots",
-			len(opts), len(a.exitItems))
+	choices := []choice{{label: "None", value: "", checked: current == "", enabled: true}}
+	for _, n := range nodes {
+		label := n.name
+		if !n.online {
+			label += " (offline)"
+		}
+		// Select by IP: HostName isn't unique within a tailnet.
+		choices = append(choices, choice{label: label, value: n.ip, checked: n.current, enabled: n.online})
 	}
+	a.exitNodes.set(choices)
+
+	// Menu item tooltips aren't part of the D-Bus menu protocol, so the
+	// reason the submenu is disabled goes in its label instead.
+	switch {
+	case !s.loggedIn():
+		a.exitNode.set("Exit node", false, false, true)
+	case current != "":
+		a.exitNode.set("Exit node: "+current, true, false, true)
+	case !anyOnline:
+		a.exitNode.set("Exit node (none available)", false, false, true)
+	default:
+		a.exitNode.set("Exit node", true, false, true)
+	}
+}
+
+// run executes a tailscale CLI command in the background, reports failure as
+// a desktop notification, and refreshes the menu when done.
+func (a *app) run(what string, args ...string) {
+	go func() {
+		if err := tailscale(args...); err != nil {
+			notifyError(what+" failed", err)
+		}
+		a.refresh()
+	}()
 }
 
 func (a *app) toggleConnect() {
 	a.mu.Lock()
-	s := a.status
+	s := a.snap.status
 	a.mu.Unlock()
 
-	if s == nil || !s.loggedIn() {
+	switch {
+	case !s.loggedIn():
 		log.Println("not logged in; ignoring toggle")
-		return
+	case s.connected():
+		a.run("Disconnect", "down")
+	default:
+		a.run("Connect", "up")
 	}
-	if s.connected() {
-		if err := run("tailscale", "down"); err != nil {
-			log.Printf("down failed: %v", err)
-		}
-	} else {
-		if err := run("tailscale", "up"); err != nil {
-			log.Printf("up failed: %v", err)
-		}
-	}
-	a.refresh()
 }
 
-func (a *app) copyIP() {
+func (a *app) switchProfile(id string) {
 	a.mu.Lock()
-	s := a.status
+	a.tailnets.markStale()
+	current := a.snap.currentProfile
 	a.mu.Unlock()
-	if s == nil || len(s.Self.TailscaleIPs) == 0 {
+
+	if id == current {
+		go a.refresh()
 		return
 	}
-	ip := s.Self.TailscaleIPs[0]
+	a.run("Switch tailnet", "switch", id)
+}
 
+func (a *app) setExitNode(ip string) {
+	a.mu.Lock()
+	a.exitNodes.markStale()
+	a.mu.Unlock()
+
+	a.run("Set exit node", "set", "--exit-node="+ip)
+}
+
+func (a *app) togglePref(pref preference, it *item) {
+	a.mu.Lock()
+	it.markStale()
+	p := a.snap.prefs
+	a.mu.Unlock()
+
+	if p == nil {
+		go a.refresh()
+		return
+	}
+	a.run("Change preference", "set", pref.flag(!pref.checked(p)))
+}
+
+func (a *app) copyIPToClipboard() {
+	a.mu.Lock()
+	ip := a.snap.status.ip()
+	a.mu.Unlock()
+	if ip == "" {
+		return
+	}
 	if err := copyToClipboard(ip); err != nil {
-		log.Printf("copy failed: %v", err)
+		notifyError("Copy IP failed", err)
 	}
 }
 
@@ -372,39 +405,11 @@ func copyToClipboard(text string) error {
 		{"xclip", "-selection", "clipboard"},
 	} {
 		cmd := exec.Command(candidate[0], candidate[1:]...)
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			continue
-		}
+		cmd.Stdin = strings.NewReader(text)
 		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			continue
-		}
-		stdin.Write([]byte(text))
-		stdin.Close()
-		if err := cmd.Wait(); err == nil {
+		if err := cmd.Run(); err == nil {
 			return nil
 		}
 	}
 	return fmt.Errorf("no clipboard tool worked (install wl-clipboard or xclip)")
-}
-
-func (a *app) setExitNode(host string) {
-	if host == "" {
-		if err := run("tailscale", "set", "--exit-node="); err != nil {
-			log.Printf("clear exit node failed: %v", err)
-		}
-	} else {
-		if err := run("tailscale", "set", "--exit-node="+host); err != nil {
-			log.Printf("set exit node failed: %v", err)
-		}
-	}
-	a.refresh()
-}
-
-func run(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }

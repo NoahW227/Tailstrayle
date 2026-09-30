@@ -25,7 +25,7 @@ if ! command -v tailscale >/dev/null 2>&1; then
   echo "Warning: 'tailscale' command not found. Install Tailscale first:"
   echo "  https://tailscale.com/download/linux"
 fi
-if ! sudo -n tailscale debug prefs 2>/dev/null | grep -q "\"OperatorUser\": \"$(whoami)\""; then
+if ! tailscale debug prefs 2>/dev/null | grep -q "\"OperatorUser\": \"$(whoami)\""; then
   echo "Reminder: run this once so Tailstrayle can control Tailscale without sudo:"
   echo "  sudo tailscale set --operator=\$(whoami)"
 fi

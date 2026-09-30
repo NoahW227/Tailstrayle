@@ -7,4 +7,3 @@ Icon=network-vpn
 Terminal=false
 X-KDE-autostart-after=panel
 X-GNOME-Autostart-enabled=true
-EOF

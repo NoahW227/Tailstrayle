@@ -10,23 +10,31 @@ Built as a low-memory alternative to [Trayscale](https://github.com/DeedleFake/t
 - Left-click to toggle connect/disconnect
 - Right-click menu with:
   - Current account name
+  - Current tailnet, with a submenu to switch between logged-in tailnets/accounts
   - Connect / Disconnect
-  - Exit node selection
+  - Exit node selection (grayed out when no exit nodes are available)
   - Copy this device's Tailscale IP
+  - Preferences, matching the Windows client where it applies on Linux:
+    - Use Tailscale DNS settings (`--accept-dns`)
+    - Use Tailscale subnets (`--accept-routes`)
+    - Allow incoming connections (`--shields-up`, inverted)
+    - Allow local network access via exit node (`--exit-node-allow-lan-access`)
+    - Automatically install updates (`--auto-update`)
   - Manual refresh
 - Auto-updates every 3 seconds - stays in sync if you use the CLI
+- Errors from menu actions (e.g. missing operator permission) show as desktop notifications
 
 ## Requirements
 
 - Linux with a StatusNotifierItem-compatible tray (KDE Plasma, XFCE, Cinnamon, or GNOME with the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/))
 - [Tailscale](https://tailscale.com/download/linux) installed and running
-- Go 1.21 or later (only needed to build from source)
+- Go 1.26 or later (only needed to build from source)
 - For Copy IP: `wl-clipboard` (Wayland) or `xclip` (X11)
 
 ### Fedora dependencies
 
 ```bash
-sudo dnf install golang gtk3-devel libayatana-appindicator-gtk3-devel wl-clipboard
+sudo dnf install golang wl-clipboard
 ```
 
 ## Install
@@ -68,7 +76,13 @@ sudo tailscale set --operator=$(whoami)
 sudo tailscale login
 ```
 
-After this, Tailstrayle handles connect/disconnect/exit-nodes without prompting for a password.
+After this, Tailstrayle handles connect/disconnect/exit-nodes/preferences without prompting for a password.
+
+To add another tailnet to the switcher, log in to it once from a terminal:
+
+```bash
+sudo tailscale login
+```
 
 If you use subnet routes, enable them once too:
 
@@ -104,10 +118,7 @@ sudo tailscale debug prefs | grep -i operator
 Confirm `OperatorUser` shows your username. If you ever run `tailscale logout`, you'll need to set the operator again.
 
 **"Some peers are advertising routes but --accept-routes is false"**
-Run once: `tailscale set --accept-routes`
-
-**Stale exit-node entries in the menu**
-The menu pre-allocates 5 exit-node slots at startup and reuses them. If your tailnet has more than 5 exit-node-capable peers, increase `maxExitNodes` in `main.go`. Unused slots may render as blank rows on some desktops.
+Enable Preferences → Use Tailscale subnets, or run once: `tailscale set --accept-routes`
 
 ## Building for development
 
@@ -117,6 +128,8 @@ go build -o Tailstrayle
 ```
 
 Logs go to stderr.
+
+Tailstrayle reads state from tailscaled's LocalAPI socket (`/var/run/tailscale/tailscaled.sock`) and makes changes through the `tailscale` CLI.
 
 ## License
 
