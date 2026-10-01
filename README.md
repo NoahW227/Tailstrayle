@@ -31,11 +31,7 @@ Built as a low-memory alternative to [Trayscale](https://github.com/DeedleFake/t
 - Go 1.26 or later (only needed to build from source)
 - For Copy IP: `wl-clipboard` (Wayland) or `xclip` (X11)
 
-### Fedora dependencies
-
-```bash
-sudo dnf install golang wl-clipboard
-```
+`install.sh` installs Go and the clipboard tool for you if they're missing (dnf, apt, pacman, or zypper). It only asks for `sudo` when something actually needs to be installed.
 
 ## Install
 
@@ -47,7 +43,7 @@ cd Tailstrayle
 ./install.sh
 ```
 
-The script builds the binary, installs it to `~/.local/bin/Tailstrayle`, and sets up autostart for KDE/GNOME.
+The script installs any missing dependencies, builds the binary, installs it to `~/.local/bin/Tailstrayle`, and sets up autostart for KDE/GNOME.
 
 ### Manual install
 
