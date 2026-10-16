@@ -2,7 +2,7 @@
 Type=Application
 Name=Tailstrayle
 Comment=Tailscale tray icon
-Exec=$HOME/.local/bin/Tailstrayle
+Exec=/home/<user>/.local/bin/Tailstrayle
 Icon=network-vpn
 Terminal=false
 X-KDE-autostart-after=panel

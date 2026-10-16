@@ -71,7 +71,7 @@ mv Tailstrayle "$BIN_PATH"
 
 echo "Setting up autostart..."
 mkdir -p "$AUTOSTART_DIR"
-sed "s|Exec=Tailstrayle|Exec=$BIN_PATH|" Tailstrayle.desktop > "$AUTOSTART_DIR/Tailstrayle.desktop"
+sed "s|^Exec=.*|Exec=$BIN_PATH|" Tailstrayle.desktop > "$AUTOSTART_DIR/Tailstrayle.desktop"
 
 echo
 echo "Done. Tailstrayle is installed at $BIN_PATH"

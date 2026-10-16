@@ -55,10 +55,12 @@ mv Tailstrayle ~/.local/bin/
 # Autostart (optional)
 mkdir -p ~/.config/autostart
 cp Tailstrayle.desktop ~/.config/autostart/
-sed -i "s|Exec=Tailstrayle|Exec=$HOME/.local/bin/Tailstrayle|" ~/.config/autostart/Tailstrayle.desktop
+sed -i "s|^Exec=.*|Exec=$HOME/.local/bin/Tailstrayle|" ~/.config/autostart/Tailstrayle.desktop
 ```
 
-Make sure `~/.local/bin` is in your `$PATH`.
+To run `Tailstrayle` by name from a terminal, make sure `~/.local/bin` is in your `$PATH`.
+
+**Note:** The `Exec=` line in `Tailstrayle.desktop` is a placeholder (`/home/<user>/.local/bin/Tailstrayle`) and must be updated to the full path of your binary. The `sed` command above does this for you.
 
 ## First-time Tailscale setup
 
